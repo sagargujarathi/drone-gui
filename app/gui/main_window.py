@@ -1,23 +1,14 @@
 from __future__ import annotations
 
-import datetime as dt
 import queue
-from collections import deque
 
-import pyqtgraph as pg
-from PyQt6.QtCore import QTimer, Qt, QUrl
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QFormLayout,
-    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QPushButton,
     QVBoxLayout,
@@ -25,8 +16,14 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.decision_engine import DecisionEngine
-from app.core.models import DashboardData, FlightState, Obstacle, Telemetry, parse_message
+from app.core.models import DashboardData, FlightState, VisionObstacle, parse_message
+from app.gui.panels import ActionPanel, CameraPanel, EventsPanel, PlotsPanel, TelemetryPanel
+from app.gui.theme import get_main_stylesheet
 from app.network.ws_client import WebSocketClient
+from app.vision.yolo_detector import VisionDetectionResult, YoloStreamDetector
+
+
+RIGHT_PANEL_WIDTH = 480
 
 
 class MainWindow(QMainWindow):
@@ -40,15 +37,16 @@ class MainWindow(QMainWindow):
         self._engine = DecisionEngine()
         self._last_state = FlightState.NORMAL
 
+        self._vision_detector = YoloStreamDetector(
+            on_detection=self._on_vision_detection,
+            on_status=self._on_vision_status,
+        )
         self._client = WebSocketClient(
             on_message=self._on_raw_message,
             on_status=self._on_status,
         )
 
-        self._battery_history: deque[float] = deque(maxlen=500)
-        self._ultra_history: deque[float] = deque(maxlen=500)
-
-        self._apply_theme()
+        self.setStyleSheet(get_main_stylesheet())
         self._build_ui()
 
         self._timer = QTimer(self)
@@ -57,93 +55,16 @@ class MainWindow(QMainWindow):
 
         self._append_event("info", "Dashboard ready.")
 
-    def _apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow {
-                background: #f5f1ea;
-            }
-            QWidget {
-                color: #2a2825;
-                font-family: "Segoe UI", "Trebuchet MS", sans-serif;
-                font-size: 13px;
-            }
-            QLabel#ValueLabel {
-                font-size: 14px;
-                font-weight: 600;
-                color: #24211f;
-            }
-            QLineEdit {
-                background: #fffdf8;
-                border: 1px solid #d7c7b0;
-                border-radius: 8px;
-                padding: 8px 10px;
-                selection-background-color: #2f6e5e;
-            }
-            QLineEdit:focus {
-                border: 1px solid #2f6e5e;
-            }
-            QPushButton {
-                background: #2f6e5e;
-                color: #ffffff;
-                border: none;
-                border-radius: 9px;
-                padding: 8px 14px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background: #25584b;
-            }
-            QPushButton:pressed {
-                background: #1f4a3f;
-            }
-            QPushButton#NeutralButton {
-                background: #8f6d40;
-            }
-            QPushButton#NeutralButton:hover {
-                background: #775a34;
-            }
-            QPushButton#DisconnectButton {
-                background: #8f3c37;
-            }
-            QPushButton#DisconnectButton:hover {
-                background: #742d2a;
-            }
-            QGroupBox {
-                font-size: 14px;
-                font-weight: 700;
-                color: #3f3a35;
-                border: 1px solid #ddcfba;
-                border-radius: 12px;
-                margin-top: 12px;
-                background: #fffdf9;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QListWidget {
-                border: 1px solid #dfd1bc;
-                border-radius: 10px;
-                background: #fffcf7;
-                padding: 4px;
-            }
-            """
-        )
-
     def _build_ui(self) -> None:
         root = QWidget(self)
         self.setCentralWidget(root)
+
         layout = QVBoxLayout(root)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
-        top_bar = self._build_top_bar()
-        content_grid = self._build_content_grid()
-
-        layout.addLayout(top_bar)
-        layout.addLayout(content_grid, 1)
+        layout.addLayout(self._build_top_bar())
+        layout.addLayout(self._build_content_grid(), 1)
 
     def _build_top_bar(self) -> QHBoxLayout:
         top_bar = QHBoxLayout()
@@ -152,6 +73,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("WS: disconnected")
         self.status_label.setStyleSheet("font-weight: 700; color: #4a443e;")
         self.ws_url_input = QLineEdit("ws://<drone-ip>:8765")
+
         self.state_label = QLabel("STATE: NORMAL")
         self.state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.state_label.setMinimumWidth(180)
@@ -174,116 +96,33 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(12)
 
-        telemetry_box = self._build_telemetry_box()
-        plots_box = self._build_plots_box()
-        right_col = self._build_right_column()
+        self.telemetry_panel = TelemetryPanel()
+        self.plots_panel = PlotsPanel()
+        self.camera_panel = CameraPanel(
+            on_start=self._start_vision_detection,
+            on_stop=self._stop_vision_detection,
+        )
+        self.action_panel = ActionPanel()
+        self.events_panel = EventsPanel()
 
-        grid.addWidget(telemetry_box, 0, 0)
-        grid.addWidget(plots_box, 0, 1)
-        grid.addWidget(right_col, 0, 2)
-        grid.setColumnStretch(0, 2)
-        grid.setColumnStretch(1, 3)
-        grid.setColumnStretch(2, 3)
-        return grid
-
-    def _build_telemetry_box(self) -> QGroupBox:
-        telemetry_box = QGroupBox("Telemetry")
-        telemetry_layout = QFormLayout(telemetry_box)
-        telemetry_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        telemetry_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        telemetry_layout.setHorizontalSpacing(14)
-        telemetry_layout.setVerticalSpacing(10)
-
-        self.battery_value = self._value_label("100.0 %")
-        self.xyz_value = self._value_label("x=0.00 y=0.00 z=0.00 m")
-        self.rpy_value = self._value_label("r=0.00 p=0.00 y=0.00 deg")
-        self.vel_value = self._value_label("vx=0.00 vy=0.00 vz=0.00 m/s")
-        self.mode_value = self._value_label("AUTO")
-        self.ultra_value = self._value_label("999.0 cm")
-
-        telemetry_layout.addRow("Battery", self.battery_value)
-        telemetry_layout.addRow("Position", self.xyz_value)
-        telemetry_layout.addRow("Attitude", self.rpy_value)
-        telemetry_layout.addRow("Velocity", self.vel_value)
-        telemetry_layout.addRow("Mode", self.mode_value)
-        telemetry_layout.addRow("Ultrasonic", self.ultra_value)
-        return telemetry_box
-
-    def _build_plots_box(self) -> QGroupBox:
-        plots_box = QGroupBox("Plots")
-        plots_layout = QVBoxLayout(plots_box)
-        plots_layout.setSpacing(10)
-
-        self.battery_plot = self._create_plot("Battery %", (50, 132, 107), (0, 100))
-        self.battery_curve = self.battery_plot.plot(pen=pg.mkPen(color=(50, 132, 107), width=2))
-
-        self.ultra_plot = self._create_plot("Ultrasonic Distance (cm)", (180, 103, 53), (0, 250))
-        self.ultra_curve = self.ultra_plot.plot(pen=pg.mkPen(color=(180, 103, 53), width=2))
-
-        plots_layout.addWidget(self.battery_plot)
-        plots_layout.addWidget(self.ultra_plot)
-        return plots_box
-
-    def _build_right_column(self) -> QWidget:
         right_col = QWidget()
+        right_col.setMinimumWidth(RIGHT_PANEL_WIDTH)
+        right_col.setMaximumWidth(RIGHT_PANEL_WIDTH)
         right_layout = QVBoxLayout(right_col)
         right_layout.setSpacing(10)
+        right_layout.addWidget(self.camera_panel)
+        right_layout.addWidget(self.action_panel)
+        right_layout.addWidget(self.events_panel, 1)
 
-        video_box = QGroupBox("Camera")
-        video_layout = QVBoxLayout(video_box)
-        self.video_url_input = QLineEdit("http://esp32-cam.local:81/stream")
-        self.open_video_btn = QPushButton("Load Stream")
-        self.open_video_btn.clicked.connect(self._load_video_stream)
-        self.video_view = QWebEngineView()
-        self.video_view.setMinimumHeight(260)
-        video_layout.addWidget(self.video_url_input)
-        video_layout.addWidget(self.open_video_btn)
-        video_layout.addWidget(self.video_view)
+        grid.addWidget(self.telemetry_panel, 0, 0)
+        grid.addWidget(self.plots_panel, 0, 1)
+        grid.addWidget(right_col, 0, 2)
 
-        actions_box = QGroupBox("Action")
-        actions_layout = QVBoxLayout(actions_box)
-        self.action_text = QLabel("Normal operation.")
-        self.action_text.setWordWrap(True)
-        self.action_text.setFrameShape(QFrame.Shape.StyledPanel)
-        self.action_text.setStyleSheet(
-            """
-            QLabel {
-                border: 1px solid #d8ccb8;
-                border-radius: 10px;
-                background: #fcf6ec;
-                padding: 12px;
-                font-size: 14px;
-                color: #39342f;
-            }
-            """
-        )
-        actions_layout.addWidget(self.action_text)
-
-        alerts_box = QGroupBox("Events")
-        alerts_layout = QVBoxLayout(alerts_box)
-        self.alert_list = QListWidget()
-        alerts_layout.addWidget(self.alert_list)
-
-        right_layout.addWidget(video_box)
-        right_layout.addWidget(actions_box)
-        right_layout.addWidget(alerts_box, 1)
-        self._load_video_stream()
-        return right_col
-
-    def _value_label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("ValueLabel")
-        return label
-
-    def _create_plot(self, title: str, line_color: tuple[int, int, int], y_range: tuple[int, int]) -> pg.PlotWidget:
-        plot = pg.PlotWidget(title=title)
-        plot.setYRange(*y_range)
-        plot.showGrid(x=True, y=True, alpha=0.18)
-        plot.setBackground("#fff9f2")
-        axis_pen = pg.mkPen(color=line_color, width=1)
-        plot.getAxis("left").setPen(axis_pen)
-        plot.getAxis("bottom").setPen(axis_pen)
-        return plot
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 3)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnMinimumWidth(2, RIGHT_PANEL_WIDTH)
+        return grid
 
     def _connect_ws(self) -> None:
         url = self.ws_url_input.text().strip()
@@ -303,52 +142,86 @@ class MainWindow(QMainWindow):
     def _on_status(self, status: str) -> None:
         self._queue.put({"type": "_status", "status": status})
 
+    def _on_vision_status(self, status: str) -> None:
+        self._queue.put({"type": "_vision_status", "status": status})
+
     def _tick(self) -> None:
+        telemetry_updated = False
+        obstacle_updated = False
+
         while True:
             try:
                 payload = self._queue.get_nowait()
             except queue.Empty:
                 break
 
-            if payload.get("type") == "_status":
+            payload_type = payload.get("type")
+            if payload_type == "_status":
                 self.status_label.setText(f"WS: {payload['status']}")
+                continue
+
+            if payload_type == "_vision_status":
+                self.camera_panel.set_status(payload["status"])
+                continue
+
+            if payload_type == "_vision":
+                data = payload.get("data", {})
+                self._data.vision = VisionObstacle(
+                    detected=bool(data.get("detected", False)),
+                    confidence=float(data.get("confidence", 0.0)),
+                    label=str(data.get("label", "none")),
+                    count=int(data.get("count", 0)),
+                    timestamp=float(data.get("timestamp", 0.0)),
+                )
+
+                frame_jpeg = data.get("frame_jpeg")
+                if isinstance(frame_jpeg, bytes):
+                    self.camera_panel.set_preview(frame_jpeg)
                 continue
 
             parsed = parse_message(payload)
             if parsed is None:
                 continue
-            msg_type, item = parsed
 
+            msg_type, item = parsed
             if msg_type == "telemetry":
                 self._data.telemetry = item
+                telemetry_updated = True
             elif msg_type == "obstacle":
                 self._data.obstacle = item
+                obstacle_updated = True
+            elif msg_type == "vision_obstacle":
+                self._data.vision = item
             elif msg_type == "event":
                 self._append_event(item.level, item.text, item.timestamp)
 
-        self._data.state = self._engine.evaluate(self._data.telemetry, self._data.obstacle)
-        self._refresh_ui(self._data.telemetry, self._data.obstacle, self._data.state)
+        self._refresh_ui(telemetry_updated, obstacle_updated)
 
-    def _refresh_ui(self, telemetry: Telemetry, obstacle: Obstacle, state: FlightState) -> None:
-        self.battery_value.setText(f"{telemetry.battery_pct:.1f} %")
-        self.xyz_value.setText(f"x={telemetry.x:.2f} y={telemetry.y:.2f} z={telemetry.z:.2f} m")
-        self.rpy_value.setText(f"r={telemetry.roll:.2f} p={telemetry.pitch:.2f} y={telemetry.yaw:.2f} deg")
-        self.vel_value.setText(f"vx={telemetry.vx:.2f} vy={telemetry.vy:.2f} vz={telemetry.vz:.2f} m/s")
-        self.mode_value.setText(telemetry.mode)
-        self.ultra_value.setText(f"{obstacle.ultrasonic_cm:.1f} cm ({obstacle.risk})")
+    def _refresh_ui(self, telemetry_updated: bool, obstacle_updated: bool) -> None:
+        self._data.state = self._engine.evaluate(self._data.telemetry, self._data.obstacle, self._data.vision)
 
-        self._battery_history.append(telemetry.battery_pct)
-        self._ultra_history.append(obstacle.ultrasonic_cm)
-        self.battery_curve.setData(list(self._battery_history))
-        self.ultra_curve.setData(list(self._ultra_history))
+        self.telemetry_panel.update_values(self._data.telemetry, self._data.obstacle, self._data.vision)
 
-        self.state_label.setText(f"STATE: {state.value}")
-        self.action_text.setText(self._engine.describe_action(state))
-        self._paint_state(state)
+        if telemetry_updated:
+            self.plots_panel.push_battery(self._data.telemetry.battery_pct)
+        if obstacle_updated:
+            self.plots_panel.push_ultrasonic(self._data.obstacle.ultrasonic_cm)
 
-        if state != self._last_state and state in {FlightState.SAFE_LAND, FlightState.EMERGENCY_DESCENT}:
-            self._append_event("warn", self._engine.describe_action(state))
-        self._last_state = state
+        self.state_label.setText(f"STATE: {self._data.state.value}")
+        self._paint_state(self._data.state)
+
+        action_text = self._engine.describe_action(self._data.state)
+        if self._data.state == FlightState.AVOIDANCE and self._data.vision.detected:
+            action_text = "Obstacle detected by camera. Apply path correction and limit forward velocity."
+        self.action_panel.set_action(action_text)
+
+        if self._data.state != self._last_state and self._data.state in {
+            FlightState.SAFE_LAND,
+            FlightState.EMERGENCY_DESCENT,
+        }:
+            self._append_event("warn", self._engine.describe_action(self._data.state))
+
+        self._last_state = self._data.state
 
     def _paint_state(self, state: FlightState) -> None:
         color = QColor("#2e7d32")
@@ -369,24 +242,39 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _start_vision_detection(self) -> None:
+        source = self.camera_panel.source_text() or "auto"
+        self._vision_detector.start(
+            stream_url=source,
+            model_path="yolov8n.pt",
+            confidence_threshold=0.5,
+            infer_fps=4.0,
+        )
+        self._append_event("info", f"Vision detector started on source: {source}")
+
+    def _stop_vision_detection(self) -> None:
+        self._vision_detector.stop()
+        self._append_event("info", "Vision detector stopped.")
+
+    def _on_vision_detection(self, result: VisionDetectionResult) -> None:
+        self._queue.put(
+            {
+                "type": "_vision",
+                "data": {
+                    "detected": result.detected,
+                    "confidence": result.confidence,
+                    "label": result.label,
+                    "count": result.count,
+                    "timestamp": result.timestamp,
+                    "frame_jpeg": result.frame_jpeg,
+                },
+            }
+        )
+
     def _append_event(self, level: str, text: str, ts: float | None = None) -> None:
-        timestamp = dt.datetime.fromtimestamp(ts) if ts else dt.datetime.now()
-        item = QListWidgetItem(f"[{timestamp.strftime('%H:%M:%S')}] {level.upper()} - {text}")
-        if level.lower() in {"warn", "warning"}:
-            item.setForeground(QColor("#ef6c00"))
-        elif level.lower() in {"error", "critical"}:
-            item.setForeground(QColor("#b71c1c"))
-
-        self.alert_list.insertItem(0, item)
-        if self.alert_list.count() > 200:
-            self.alert_list.takeItem(self.alert_list.count() - 1)
-
-    def _load_video_stream(self) -> None:
-        url = self.video_url_input.text().strip()
-        if url:
-            self.video_view.setUrl(QUrl(url))
-            self._append_event("info", f"Loaded video stream: {url}")
+        self.events_panel.append_event(level, text, ts)
 
     def closeEvent(self, event) -> None:
+        self._vision_detector.stop()
         self._client.disconnect()
         super().closeEvent(event)

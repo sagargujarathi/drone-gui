@@ -2,3 +2,5 @@ PyQt6>=6.8.0
 PyQt6-WebEngine>=6.8.0
 pyqtgraph>=0.13.7
 websockets>=12.0
+opencv-python>=4.10.0.84
+ultralytics>=8.3.0

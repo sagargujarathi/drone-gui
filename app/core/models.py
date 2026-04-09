@@ -38,6 +38,15 @@ class Obstacle:
 
 
 @dataclass
+class VisionObstacle:
+    detected: bool = False
+    confidence: float = 0.0
+    label: str = "none"
+    count: int = 0
+    timestamp: float = 0.0
+
+
+@dataclass
 class EventMessage:
     level: str
     text: str
@@ -49,6 +58,7 @@ class EventMessage:
 class DashboardData:
     telemetry: Telemetry = field(default_factory=Telemetry)
     obstacle: Obstacle = field(default_factory=Obstacle)
+    vision: VisionObstacle = field(default_factory=VisionObstacle)
     state: FlightState = FlightState.NORMAL
 
 
@@ -92,6 +102,16 @@ def parse_message(payload: dict[str, Any]) -> tuple[str, Any] | None:
             text=str(data.get("text", "")),
             timestamp=ts,
             source=str(payload.get("source", "system")),
+        )
+        return msg_type, item
+
+    if msg_type == "vision_obstacle":
+        item = VisionObstacle(
+            detected=bool(data.get("detected", False)),
+            confidence=float(data.get("confidence", 0.0)),
+            label=str(data.get("label", "none")),
+            count=int(data.get("count", 0)),
+            timestamp=ts,
         )
         return msg_type, item
 

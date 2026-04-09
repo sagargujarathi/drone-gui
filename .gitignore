@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# Downloaded default model (generated at runtime)
+yolov8n.pt
